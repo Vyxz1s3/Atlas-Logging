@@ -2,8 +2,6 @@ require('dotenv').config();
 const {
   Client,
   GatewayIntentBits,
-  EmbedBuilder,
-  Colors,
   ChannelType,
   PermissionsBitField,
 } = require('discord.js');
@@ -42,20 +40,19 @@ const inviteCache = new Map();
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the log channel and send an embed.
+ * Resolve the log channel and send a JSON log object as a code block.
  * Falls back to console.log when LOG_CHANNEL_ID is not set or the channel
  * cannot be found.
  *
  * @param {import('discord.js').Guild|null} guild
- * @param {import('discord.js').EmbedBuilder} embed
+ * @param {object} logObject  Plain JS object describing the event
  */
-async function sendLog(guild, embed) {
+async function sendLog(guild, logObject) {
   const channelId = process.env.LOG_CHANNEL_ID;
 
-  if (!channelId) {
-    console.log('[LOG]', JSON.stringify(embed.toJSON(), null, 2));
-    return;
-  }
+  console.log('[LOG]', JSON.stringify(logObject, null, 2));
+
+  if (!channelId) return;
 
   try {
     const channel = guild
@@ -69,29 +66,16 @@ async function sendLog(guild, embed) {
       return;
     }
 
-    await channel.send({ embeds: [embed] });
+    const json    = JSON.stringify(logObject, null, 2);
+    // Discord messages are capped at 2000 characters; truncate the payload
+    // inside the code block if necessary so the send never fails.
+    const maxJson = 1980; // 2000 − len("```json\n" + "\n```")
+    const body    = json.length > maxJson ? json.slice(0, maxJson - 1) + '…' : json;
+
+    await channel.send(`\`\`\`json\n${body}\n\`\`\``);
   } catch (err) {
-    console.error('[ERROR] Failed to send log embed:', err);
+    console.error('[ERROR] Failed to send log message:', err);
   }
-}
-
-/**
- * Build a base embed with a consistent style.
- *
- * @param {object} opts
- * @param {string}  opts.title
- * @param {number}  opts.color
- * @param {string} [opts.description]
- * @returns {import('discord.js').EmbedBuilder}
- */
-function buildEmbed({ title, color, description }) {
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(color)
-    .setTimestamp();
-
-  if (description) embed.setDescription(description);
-  return embed;
 }
 
 /**
@@ -115,12 +99,12 @@ function channelTypeLabel(type) {
 }
 
 /**
- * Diff two PermissionsBitField values and return a human-readable string
- * listing added and removed permissions, or null if nothing changed.
+ * Diff two PermissionsBitField values and return an object with added/removed
+ * permission name arrays, or null if nothing changed.
  *
  * @param {bigint} oldBits
  * @param {bigint} newBits
- * @returns {string|null}
+ * @returns {{ added: string[], removed: string[] }|null}
  */
 function diffPermissions(oldBits, newBits) {
   if (oldBits === newBits) return null;
@@ -128,10 +112,8 @@ function diffPermissions(oldBits, newBits) {
   const added   = new PermissionsBitField(newBits & ~oldBits).toArray();
   const removed = new PermissionsBitField(oldBits & ~newBits).toArray();
 
-  const lines = [];
-  if (added.length)   lines.push(`**Added:** ${added.join(', ')}`);
-  if (removed.length) lines.push(`**Removed:** ${removed.join(', ')}`);
-  return lines.join('\n') || null;
+  if (!added.length && !removed.length) return null;
+  return { added, removed };
 }
 
 /**
@@ -170,95 +152,105 @@ client.once('ready', async () => {
 client.on('channelCreate', async (channel) => {
   if (!channel.guild) return; // ignore DM channels
 
-  const embed = buildEmbed({
-    title: '📢 Channel Created',
-    color: Colors.Green,
-    description:
-      `**Name:** ${channel.name}\n` +
-      `**Type:** ${channelTypeLabel(channel.type)}\n` +
-      (channel.parent ? `**Category:** ${channel.parent.name}\n` : '') +
-      `**ID:** ${channel.id}`,
+  await sendLog(channel.guild, {
+    event:     'channelCreate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: channel.guild.id, name: channel.guild.name },
+    data: {
+      id:       channel.id,
+      name:     channel.name,
+      type:     channelTypeLabel(channel.type),
+      category: channel.parent?.name ?? null,
+    },
   });
-
-  await sendLog(channel.guild, embed);
 });
 
 client.on('channelDelete', async (channel) => {
   if (!channel.guild) return;
 
-  const embed = buildEmbed({
-    title: '🗑️ Channel Deleted',
-    color: Colors.Red,
-    description:
-      `**Name:** ${channel.name}\n` +
-      `**Type:** ${channelTypeLabel(channel.type)}\n` +
-      (channel.parent ? `**Category:** ${channel.parent.name}\n` : '') +
-      `**ID:** ${channel.id}`,
+  await sendLog(channel.guild, {
+    event:     'channelDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: channel.guild.id, name: channel.guild.name },
+    data: {
+      id:       channel.id,
+      name:     channel.name,
+      type:     channelTypeLabel(channel.type),
+      category: channel.parent?.name ?? null,
+    },
   });
-
-  await sendLog(channel.guild, embed);
 });
 
 client.on('channelUpdate', async (oldChannel, newChannel) => {
   if (!newChannel.guild) return;
 
-  const changes = [];
+  const changes = {};
 
   if (oldChannel.name !== newChannel.name) {
-    changes.push(`**Name:** \`${oldChannel.name}\` → \`${newChannel.name}\``);
+    changes.name = { from: oldChannel.name, to: newChannel.name };
   }
 
   if ('topic' in oldChannel && oldChannel.topic !== newChannel.topic) {
-    changes.push(
-      `**Topic:** ${oldChannel.topic || '*(none)*'} → ${newChannel.topic || '*(none)*'}`,
-    );
+    changes.topic = { from: oldChannel.topic ?? null, to: newChannel.topic ?? null };
   }
 
   if ('rateLimitPerUser' in oldChannel && oldChannel.rateLimitPerUser !== newChannel.rateLimitPerUser) {
-    changes.push(
-      `**Slowmode:** ${oldChannel.rateLimitPerUser}s → ${newChannel.rateLimitPerUser}s`,
-    );
+    changes.slowmode = { from: oldChannel.rateLimitPerUser, to: newChannel.rateLimitPerUser };
   }
 
   if ('nsfw' in oldChannel && oldChannel.nsfw !== newChannel.nsfw) {
-    changes.push(`**NSFW:** ${oldChannel.nsfw} → ${newChannel.nsfw}`);
+    changes.nsfw = { from: oldChannel.nsfw, to: newChannel.nsfw };
   }
 
   // ── Permission overwrite diff ──────────────────────────────────────────
   const oldOverwrites = oldChannel.permissionOverwrites?.cache ?? new Map();
   const newOverwrites = newChannel.permissionOverwrites?.cache ?? new Map();
   const allIds = new Set([...oldOverwrites.keys(), ...newOverwrites.keys()]);
+  const permissionChanges = [];
 
   for (const id of allIds) {
     const oldOW = oldOverwrites.get(id);
     const newOW = newOverwrites.get(id);
+    const targetType = (newOW ?? oldOW).type === 0 ? 'role' : 'member';
 
     if (!oldOW && newOW) {
-      changes.push(`**Permissions added for** <@${newOW.type === 0 ? '&' : ''}${id}>`);
+      permissionChanges.push({ id, targetType, action: 'added' });
       continue;
     }
     if (oldOW && !newOW) {
-      changes.push(`**Permissions removed for** <@${oldOW.type === 0 ? '&' : ''}${id}>`);
+      permissionChanges.push({ id, targetType, action: 'removed' });
       continue;
     }
     if (oldOW && newOW) {
       const allowDiff = diffPermissions(oldOW.allow.bitfield, newOW.allow.bitfield);
       const denyDiff  = diffPermissions(oldOW.deny.bitfield,  newOW.deny.bitfield);
-      const target    = newOW.type === 0 ? `<@&${id}>` : `<@${id}>`;
-      if (allowDiff) changes.push(`**Allow overwrite for ${target}:**\n${allowDiff}`);
-      if (denyDiff)  changes.push(`**Deny overwrite for ${target}:**\n${denyDiff}`);
+      if (allowDiff || denyDiff) {
+        permissionChanges.push({
+          id,
+          targetType,
+          action:  'updated',
+          allow:   allowDiff ?? undefined,
+          deny:    denyDiff  ?? undefined,
+        });
+      }
     }
   }
 
-  if (changes.length === 0) return;
+  if (permissionChanges.length) changes.permissions = permissionChanges;
 
-  const embed = buildEmbed({
-    title: '✏️ Channel Updated',
-    color: Colors.Yellow,
-    description: `**Channel:** <#${newChannel.id}>\n${changes.join('\n')}`,
+  if (Object.keys(changes).length === 0) return;
+
+  await sendLog(newChannel.guild, {
+    event:     'channelUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newChannel.guild.id, name: newChannel.guild.name },
+    data: {
+      id:      newChannel.id,
+      name:    newChannel.name,
+      type:    channelTypeLabel(newChannel.type),
+      changes,
+    },
   });
-
-  await sendLog(newChannel.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -269,15 +261,17 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 client.on('guildMemberAdd', async (member) => {
   // ── Bot added ────────────────────────────────────────────────────────────
   if (member.user.bot) {
-    const embed = buildEmbed({
-      title: '🤖 Bot Added',
-      color: Colors.Blurple,
-      description:
-        `**Bot:** ${member.user.tag} (${member.user.id})\n` +
-        `**Account created:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`,
+    await sendLog(member.guild, {
+      event:     'botAdd',
+      timestamp: new Date().toISOString(),
+      guild:     { id: member.guild.id, name: member.guild.name },
+      data: {
+        id:             member.user.id,
+        tag:            member.user.tag,
+        accountCreated: new Date(member.user.createdTimestamp).toISOString(),
+        avatarURL:      member.user.displayAvatarURL({ dynamic: true }),
+      },
     });
-    embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true }));
-    await sendLog(member.guild, embed);
     return;
   }
 
@@ -305,110 +299,107 @@ client.on('guildMemberAdd', async (member) => {
     // Bot may lack MANAGE_GUILD — skip silently
   }
 
-  const lines = [
-    `**User:** ${member.user.tag} (${member.user.id})`,
-    `**Account created:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`,
-  ];
-  if (usedInvite) {
-    lines.push(
-      `**Invite used:** \`${usedInvite.code}\`` +
-      (usedInvite.inviter ? ` (created by ${usedInvite.inviter.tag})` : ''),
-    );
-  }
-  if (isNewAccount) {
-    lines.push(`⚠️ **New account** — created ${accountAgeDays.toFixed(1)} days ago`);
-  }
-
-  const embed = buildEmbed({
-    title: isNewAccount ? '⚠️ Member Joined (New Account)' : '👋 Member Joined',
-    color: isNewAccount ? Colors.Orange : Colors.Green,
-    description: lines.join('\n'),
+  await sendLog(member.guild, {
+    event:     'memberJoin',
+    timestamp: new Date().toISOString(),
+    guild:     { id: member.guild.id, name: member.guild.name },
+    data: {
+      id:              member.user.id,
+      tag:             member.user.tag,
+      accountCreated:  new Date(member.user.createdTimestamp).toISOString(),
+      accountAgeDays:  parseFloat(accountAgeDays.toFixed(2)),
+      newAccount:      isNewAccount,
+      avatarURL:       member.user.displayAvatarURL({ dynamic: true }),
+      invite:          usedInvite
+        ? {
+            code:    usedInvite.code,
+            inviter: usedInvite.inviter?.tag ?? null,
+          }
+        : null,
+    },
   });
-  embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true }));
-
-  await sendLog(member.guild, embed);
 });
 
 client.on('guildMemberRemove', async (member) => {
   // ── Bot removed ───────────────────────────────────────────────────────────
   if (member.user.bot) {
-    const embed = buildEmbed({
-      title: '🤖 Bot Removed',
-      color: Colors.Red,
-      description: `**Bot:** ${member.user.tag} (${member.user.id})`,
+    await sendLog(member.guild, {
+      event:     'botRemove',
+      timestamp: new Date().toISOString(),
+      guild:     { id: member.guild.id, name: member.guild.name },
+      data: {
+        id:        member.user.id,
+        tag:       member.user.tag,
+        avatarURL: member.user.displayAvatarURL({ dynamic: true }),
+      },
     });
-    embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true }));
-    await sendLog(member.guild, embed);
     return;
   }
 
-  const embed = buildEmbed({
-    title: '🚪 Member Left',
-    color: Colors.Orange,
-    description:
-      `**User:** ${member.user.tag} (${member.user.id})\n` +
-      `**Joined:** ${
-        member.joinedAt
-          ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`
-          : 'Unknown'
-      }`,
+  await sendLog(member.guild, {
+    event:     'memberLeave',
+    timestamp: new Date().toISOString(),
+    guild:     { id: member.guild.id, name: member.guild.name },
+    data: {
+      id:        member.user.id,
+      tag:       member.user.tag,
+      joinedAt:  member.joinedAt ? member.joinedAt.toISOString() : null,
+      avatarURL: member.user.displayAvatarURL({ dynamic: true }),
+    },
   });
-  embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true }));
-
-  await sendLog(member.guild, embed);
 });
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
-  const changes = [];
+  const changes = {};
 
   // ── Username / global display name ────────────────────────────────────────
   if (oldMember.user.username !== newMember.user.username) {
-    changes.push(
-      `**Username:** \`${oldMember.user.username}\` → \`${newMember.user.username}\``,
-    );
+    changes.username = { from: oldMember.user.username, to: newMember.user.username };
   }
 
   if (oldMember.user.globalName !== newMember.user.globalName) {
-    changes.push(
-      `**Global display name:** \`${oldMember.user.globalName ?? 'none'}\` → \`${newMember.user.globalName ?? 'none'}\``,
-    );
+    changes.globalName = {
+      from: oldMember.user.globalName ?? null,
+      to:   newMember.user.globalName ?? null,
+    };
   }
 
   // ── Nickname ──────────────────────────────────────────────────────────────
   if (oldMember.nickname !== newMember.nickname) {
-    changes.push(
-      `**Nickname:** \`${oldMember.nickname ?? 'none'}\` → \`${newMember.nickname ?? 'none'}\``,
-    );
+    changes.nickname = { from: oldMember.nickname ?? null, to: newMember.nickname ?? null };
   }
 
   // ── Server boost ──────────────────────────────────────────────────────────
   const wasBoosting = !!oldMember.premiumSince;
   const isBoosting  = !!newMember.premiumSince;
-  if (!wasBoosting && isBoosting) {
-    changes.push('🚀 **Started boosting the server**');
-  } else if (wasBoosting && !isBoosting) {
-    changes.push('💔 **Stopped boosting the server**');
+  if (wasBoosting !== isBoosting) {
+    changes.boosting = { from: wasBoosting, to: isBoosting };
   }
 
   // ── Roles added / removed ─────────────────────────────────────────────────
   const addedRoles   = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
   const removedRoles = oldMember.roles.cache.filter((r) => !newMember.roles.cache.has(r.id));
 
-  if (addedRoles.size)   changes.push(`**Roles added:** ${addedRoles.map((r) => `<@&${r.id}>`).join(', ')}`);
-  if (removedRoles.size) changes.push(`**Roles removed:** ${removedRoles.map((r) => `<@&${r.id}>`).join(', ')}`);
+  if (addedRoles.size) {
+    changes.rolesAdded = addedRoles.map((r) => ({ id: r.id, name: r.name }));
+  }
+  if (removedRoles.size) {
+    changes.rolesRemoved = removedRoles.map((r) => ({ id: r.id, name: r.name }));
+  }
 
-  if (changes.length === 0) return;
+  if (Object.keys(changes).length === 0) return;
 
-  const embed = buildEmbed({
-    title: '👤 Member Updated',
-    color: Colors.Yellow,
-    description:
-      `**User:** ${newMember.user.tag} (${newMember.user.id})\n` +
-      changes.join('\n'),
+  await sendLog(newMember.guild, {
+    event:     'memberUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newMember.guild.id, name: newMember.guild.name },
+    data: {
+      id:        newMember.user.id,
+      tag:       newMember.user.tag,
+      avatarURL: newMember.user.displayAvatarURL({ dynamic: true }),
+      changes,
+    },
   });
-  embed.setThumbnail(newMember.user.displayAvatarURL({ dynamic: true }));
-
-  await sendLog(newMember.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -421,16 +412,17 @@ client.on('messageDelete', async (message) => {
   if (message.partial) return;
   if (message.author?.bot) return;
 
-  const embed = buildEmbed({
-    title: '🗑️ Message Deleted',
-    color: Colors.Red,
-    description:
-      `**Author:** ${message.author?.tag ?? 'Unknown'} (${message.author?.id ?? 'Unknown'})\n` +
-      `**Channel:** <#${message.channelId}>\n` +
-      `**Content:**\n${truncate(message.content || '*(no text content)*', 1800)}`,
+  await sendLog(message.guild, {
+    event:     'messageDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: message.guild.id, name: message.guild.name },
+    data: {
+      messageId: message.id,
+      channelId: message.channelId,
+      author:    { id: message.author?.id ?? null, tag: message.author?.tag ?? null },
+      content:   truncate(message.content || null, 1800),
+    },
   });
-
-  await sendLog(message.guild, embed);
 });
 
 client.on('messageUpdate', async (oldMessage, newMessage) => {
@@ -439,18 +431,19 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   if (newMessage.author?.bot) return;
   if (oldMessage.content === newMessage.content) return; // embed-only update
 
-  const embed = buildEmbed({
-    title: '✏️ Message Edited',
-    color: Colors.Yellow,
-    description:
-      `**Author:** ${newMessage.author?.tag ?? 'Unknown'} (${newMessage.author?.id ?? 'Unknown'})\n` +
-      `**Channel:** <#${newMessage.channelId}>\n` +
-      `**[Jump to message](${newMessage.url})**\n\n` +
-      `**Before:**\n${truncate(oldMessage.content || '*(no text content)*', 800)}\n\n` +
-      `**After:**\n${truncate(newMessage.content || '*(no text content)*', 800)}`,
+  await sendLog(newMessage.guild, {
+    event:     'messageEdit',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newMessage.guild.id, name: newMessage.guild.name },
+    data: {
+      messageId: newMessage.id,
+      channelId: newMessage.channelId,
+      url:       newMessage.url,
+      author:    { id: newMessage.author?.id ?? null, tag: newMessage.author?.tag ?? null },
+      before:    truncate(oldMessage.content || null, 800),
+      after:     truncate(newMessage.content || null, 800),
+    },
   });
-
-  await sendLog(newMessage.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -459,74 +452,77 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 client.on('roleCreate', async (role) => {
-  const embed = buildEmbed({
-    title: '🎭 Role Created',
-    color: Colors.Green,
-    description:
-      `**Name:** ${role.name}\n` +
-      `**Color:** ${role.hexColor}\n` +
-      `**Hoisted:** ${role.hoist}\n` +
-      `**Mentionable:** ${role.mentionable}\n` +
-      `**ID:** ${role.id}`,
+  await sendLog(role.guild, {
+    event:     'roleCreate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: role.guild.id, name: role.guild.name },
+    data: {
+      id:          role.id,
+      name:        role.name,
+      color:       role.hexColor,
+      hoisted:     role.hoist,
+      mentionable: role.mentionable,
+    },
   });
-
-  await sendLog(role.guild, embed);
 });
 
 client.on('roleDelete', async (role) => {
-  const embed = buildEmbed({
-    title: '🎭 Role Deleted',
-    color: Colors.Red,
-    description:
-      `**Name:** ${role.name}\n` +
-      `**Color:** ${role.hexColor}\n` +
-      `**ID:** ${role.id}`,
+  await sendLog(role.guild, {
+    event:     'roleDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: role.guild.id, name: role.guild.name },
+    data: {
+      id:    role.id,
+      name:  role.name,
+      color: role.hexColor,
+    },
   });
-
-  await sendLog(role.guild, embed);
 });
 
 client.on('roleUpdate', async (oldRole, newRole) => {
-  const changes = [];
+  const changes = {};
 
   if (oldRole.name !== newRole.name) {
-    changes.push(`**Name:** \`${oldRole.name}\` → \`${newRole.name}\``);
+    changes.name = { from: oldRole.name, to: newRole.name };
   }
 
   if (oldRole.hexColor !== newRole.hexColor) {
-    changes.push(`**Color:** \`${oldRole.hexColor}\` → \`${newRole.hexColor}\``);
+    changes.color = { from: oldRole.hexColor, to: newRole.hexColor };
   }
 
   if (oldRole.hoist !== newRole.hoist) {
-    changes.push(`**Hoisted:** ${oldRole.hoist} → ${newRole.hoist}`);
+    changes.hoisted = { from: oldRole.hoist, to: newRole.hoist };
   }
 
   if (oldRole.mentionable !== newRole.mentionable) {
-    changes.push(`**Mentionable:** ${oldRole.mentionable} → ${newRole.mentionable}`);
+    changes.mentionable = { from: oldRole.mentionable, to: newRole.mentionable };
   }
 
   if (oldRole.position !== newRole.position) {
-    changes.push(`**Position:** ${oldRole.position} → ${newRole.position}`);
+    changes.position = { from: oldRole.position, to: newRole.position };
   }
 
   // Role icon (requires ROLE_ICONS feature)
   if (oldRole.icon !== newRole.icon) {
-    changes.push(`**Icon changed**`);
+    changes.icon = { from: oldRole.icon ?? null, to: newRole.icon ?? null };
   }
 
   // Permission diff
   const permDiff = diffPermissions(oldRole.permissions.bitfield, newRole.permissions.bitfield);
-  if (permDiff) changes.push(`**Permissions:**\n${permDiff}`);
+  if (permDiff) changes.permissions = permDiff;
 
-  if (changes.length === 0) return;
+  if (Object.keys(changes).length === 0) return;
 
-  const embed = buildEmbed({
-    title: '✏️ Role Updated',
-    color: Colors.Yellow,
-    description: `**Role:** <@&${newRole.id}>\n${changes.join('\n')}`,
+  await sendLog(newRole.guild, {
+    event:     'roleUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newRole.guild.id, name: newRole.guild.name },
+    data: {
+      id:      newRole.id,
+      name:    newRole.name,
+      changes,
+    },
   });
-
-  await sendLog(newRole.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -540,63 +536,44 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   if (member.user.bot) return; // ignore bot voice activity
 
   const guild = newState.guild ?? oldState.guild;
-  const lines = [`**User:** ${member.user.tag} (${member.user.id})`];
-  let title = '';
-  let color = Colors.Blurple;
 
-  // ── Channel join / leave / switch ─────────────────────────────────────────
+  // ── Determine channel action ───────────────────────────────────────────────
+  let action;
   if (!oldState.channelId && newState.channelId) {
-    title = '🔊 Joined Voice Channel';
-    color = Colors.Green;
-    lines.push(`**Channel:** <#${newState.channelId}>`);
+    action = 'join';
   } else if (oldState.channelId && !newState.channelId) {
-    title = '🔇 Left Voice Channel';
-    color = Colors.Red;
-    lines.push(`**Channel:** <#${oldState.channelId}>`);
+    action = 'leave';
   } else if (oldState.channelId !== newState.channelId) {
-    title = '🔀 Switched Voice Channel';
-    color = Colors.Yellow;
-    lines.push(`**From:** <#${oldState.channelId}> → **To:** <#${newState.channelId}>`);
+    action = 'switch';
   } else {
-    // Same channel — state change
-    title = '🎙️ Voice State Changed';
-    color = Colors.Blurple;
-    lines.push(`**Channel:** <#${newState.channelId}>`);
+    action = 'stateChange';
   }
 
-  // ── State flags ───────────────────────────────────────────────────────────
-  const flags = [];
+  // ── State flag changes ────────────────────────────────────────────────────
+  const stateChanges = {};
 
-  if (oldState.selfMute !== newState.selfMute) {
-    flags.push(newState.selfMute ? '🔇 Self-muted' : '🔊 Self-unmuted');
-  }
-  if (oldState.selfDeaf !== newState.selfDeaf) {
-    flags.push(newState.selfDeaf ? '🙉 Self-deafened' : '👂 Self-undeafened');
-  }
-  if (oldState.serverMute !== newState.serverMute) {
-    flags.push(newState.serverMute ? '🔇 Server muted' : '🔊 Server unmuted');
-  }
-  if (oldState.serverDeaf !== newState.serverDeaf) {
-    flags.push(newState.serverDeaf ? '🙉 Server deafened' : '👂 Server undeafened');
-  }
-  if (oldState.streaming !== newState.streaming) {
-    flags.push(newState.streaming ? '📡 Started screen share' : '📡 Stopped screen share');
-  }
-  if (oldState.selfVideo !== newState.selfVideo) {
-    flags.push(newState.selfVideo ? '📷 Camera on' : '📷 Camera off');
-  }
+  if (oldState.selfMute !== newState.selfMute)     stateChanges.selfMute     = newState.selfMute;
+  if (oldState.selfDeaf !== newState.selfDeaf)     stateChanges.selfDeaf     = newState.selfDeaf;
+  if (oldState.serverMute !== newState.serverMute) stateChanges.serverMute   = newState.serverMute;
+  if (oldState.serverDeaf !== newState.serverDeaf) stateChanges.serverDeaf   = newState.serverDeaf;
+  if (oldState.streaming !== newState.streaming)   stateChanges.streaming    = newState.streaming;
+  if (oldState.selfVideo !== newState.selfVideo)   stateChanges.cameraOn     = newState.selfVideo;
 
-  // If the only thing that changed is a state flag (no channel change), skip
-  // logging pure self-mute/deafen spam unless there's something meaningful.
-  if (
-    title === '🎙️ Voice State Changed' &&
-    flags.length === 0
-  ) return;
+  // Skip pure self-mute/deafen spam with no channel change
+  if (action === 'stateChange' && Object.keys(stateChanges).length === 0) return;
 
-  if (flags.length) lines.push(flags.join('\n'));
-
-  const embed = buildEmbed({ title, color, description: lines.join('\n') });
-  await sendLog(guild, embed);
+  await sendLog(guild, {
+    event:     'voiceStateUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: guild.id, name: guild.name },
+    data: {
+      user:         { id: member.user.id, tag: member.user.tag },
+      action,
+      fromChannel:  oldState.channelId ?? null,
+      toChannel:    newState.channelId ?? null,
+      stateChanges: Object.keys(stateChanges).length ? stateChanges : undefined,
+    },
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -605,84 +582,64 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 client.on('guildUpdate', async (oldGuild, newGuild) => {
-  const changes = [];
+  const changes = {};
 
   if (oldGuild.name !== newGuild.name) {
-    changes.push(`**Name:** \`${oldGuild.name}\` → \`${newGuild.name}\``);
+    changes.name = { from: oldGuild.name, to: newGuild.name };
   }
 
   if (oldGuild.icon !== newGuild.icon) {
-    changes.push(
-      `**Icon:** ${newGuild.iconURL() ? `[new icon](${newGuild.iconURL()})` : 'removed'}`,
-    );
+    changes.icon = { from: oldGuild.iconURL() ?? null, to: newGuild.iconURL() ?? null };
   }
 
   if (oldGuild.banner !== newGuild.banner) {
-    changes.push(
-      `**Banner:** ${newGuild.bannerURL() ? `[new banner](${newGuild.bannerURL()})` : 'removed'}`,
-    );
+    changes.banner = { from: oldGuild.bannerURL() ?? null, to: newGuild.bannerURL() ?? null };
   }
 
   if (oldGuild.splash !== newGuild.splash) {
-    changes.push(`**Invite splash:** ${newGuild.splashURL() ? 'updated' : 'removed'}`);
+    changes.splash = { from: oldGuild.splashURL() ?? null, to: newGuild.splashURL() ?? null };
   }
 
   if (oldGuild.verificationLevel !== newGuild.verificationLevel) {
-    changes.push(
-      `**Verification level:** ${oldGuild.verificationLevel} → ${newGuild.verificationLevel}`,
-    );
+    changes.verificationLevel = { from: oldGuild.verificationLevel, to: newGuild.verificationLevel };
   }
 
   if (oldGuild.explicitContentFilter !== newGuild.explicitContentFilter) {
-    changes.push(
-      `**Explicit content filter:** ${oldGuild.explicitContentFilter} → ${newGuild.explicitContentFilter}`,
-    );
+    changes.explicitContentFilter = { from: oldGuild.explicitContentFilter, to: newGuild.explicitContentFilter };
   }
 
   if (oldGuild.defaultMessageNotifications !== newGuild.defaultMessageNotifications) {
-    changes.push(
-      `**Default notifications:** ${oldGuild.defaultMessageNotifications} → ${newGuild.defaultMessageNotifications}`,
-    );
+    changes.defaultMessageNotifications = { from: oldGuild.defaultMessageNotifications, to: newGuild.defaultMessageNotifications };
   }
 
   if (oldGuild.afkChannelId !== newGuild.afkChannelId) {
-    const oldAfk = oldGuild.afkChannelId ? `<#${oldGuild.afkChannelId}>` : 'none';
-    const newAfk = newGuild.afkChannelId ? `<#${newGuild.afkChannelId}>` : 'none';
-    changes.push(`**AFK channel:** ${oldAfk} → ${newAfk}`);
+    changes.afkChannel = { from: oldGuild.afkChannelId ?? null, to: newGuild.afkChannelId ?? null };
   }
 
   if (oldGuild.afkTimeout !== newGuild.afkTimeout) {
-    changes.push(`**AFK timeout:** ${oldGuild.afkTimeout}s → ${newGuild.afkTimeout}s`);
+    changes.afkTimeout = { from: oldGuild.afkTimeout, to: newGuild.afkTimeout };
   }
 
   if (oldGuild.systemChannelId !== newGuild.systemChannelId) {
-    const oldSys = oldGuild.systemChannelId ? `<#${oldGuild.systemChannelId}>` : 'none';
-    const newSys = newGuild.systemChannelId ? `<#${newGuild.systemChannelId}>` : 'none';
-    changes.push(`**System channel:** ${oldSys} → ${newSys}`);
+    changes.systemChannel = { from: oldGuild.systemChannelId ?? null, to: newGuild.systemChannelId ?? null };
   }
 
   if (oldGuild.rulesChannelId !== newGuild.rulesChannelId) {
-    const oldRules = oldGuild.rulesChannelId ? `<#${oldGuild.rulesChannelId}>` : 'none';
-    const newRules = newGuild.rulesChannelId ? `<#${newGuild.rulesChannelId}>` : 'none';
-    changes.push(`**Rules channel:** ${oldRules} → ${newRules}`);
+    changes.rulesChannel = { from: oldGuild.rulesChannelId ?? null, to: newGuild.rulesChannelId ?? null };
   }
 
   if (oldGuild.publicUpdatesChannelId !== newGuild.publicUpdatesChannelId) {
-    const oldPub = oldGuild.publicUpdatesChannelId ? `<#${oldGuild.publicUpdatesChannelId}>` : 'none';
-    const newPub = newGuild.publicUpdatesChannelId ? `<#${newGuild.publicUpdatesChannelId}>` : 'none';
-    changes.push(`**Community updates channel:** ${oldPub} → ${newPub}`);
+    changes.publicUpdatesChannel = { from: oldGuild.publicUpdatesChannelId ?? null, to: newGuild.publicUpdatesChannelId ?? null };
   }
 
-  if (changes.length === 0) return;
+  if (Object.keys(changes).length === 0) return;
 
-  const embed = buildEmbed({
-    title: '🏰 Server Updated',
-    color: Colors.Yellow,
-    description: `**Server:** ${newGuild.name}\n${changes.join('\n')}`,
+  await sendLog(newGuild, {
+    event:     'guildUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newGuild.id, name: newGuild.name },
+    data:      { changes },
   });
-  if (newGuild.iconURL()) embed.setThumbnail(newGuild.iconURL());
-
-  await sendLog(newGuild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -696,18 +653,18 @@ client.on('inviteCreate', async (invite) => {
   guildCache.set(invite.code, invite);
   if (invite.guild) inviteCache.set(invite.guild.id, guildCache);
 
-  const embed = buildEmbed({
-    title: '🔗 Invite Created',
-    color: Colors.Green,
-    description:
-      `**Code:** \`${invite.code}\`\n` +
-      `**Created by:** ${invite.inviter?.tag ?? 'Unknown'}\n` +
-      `**Channel:** ${invite.channel ? `<#${invite.channel.id}>` : 'Unknown'}\n` +
-      `**Max uses:** ${invite.maxUses || '∞'}\n` +
-      `**Expires:** ${invite.expiresAt ? `<t:${Math.floor(invite.expiresTimestamp / 1000)}:R>` : 'Never'}`,
+  await sendLog(invite.guild, {
+    event:     'inviteCreate',
+    timestamp: new Date().toISOString(),
+    guild:     invite.guild ? { id: invite.guild.id, name: invite.guild.name } : null,
+    data: {
+      code:      invite.code,
+      createdBy: invite.inviter?.tag ?? null,
+      channelId: invite.channel?.id ?? null,
+      maxUses:   invite.maxUses || null,
+      expiresAt: invite.expiresAt ? invite.expiresAt.toISOString() : null,
+    },
   });
-
-  await sendLog(invite.guild, embed);
 });
 
 client.on('inviteDelete', async (invite) => {
@@ -715,15 +672,15 @@ client.on('inviteDelete', async (invite) => {
   const guildCache = inviteCache.get(invite.guild?.id);
   if (guildCache) guildCache.delete(invite.code);
 
-  const embed = buildEmbed({
-    title: '🔗 Invite Deleted',
-    color: Colors.Red,
-    description:
-      `**Code:** \`${invite.code}\`\n` +
-      `**Channel:** ${invite.channel ? `<#${invite.channel.id}>` : 'Unknown'}`,
+  await sendLog(invite.guild, {
+    event:     'inviteDelete',
+    timestamp: new Date().toISOString(),
+    guild:     invite.guild ? { id: invite.guild.id, name: invite.guild.name } : null,
+    data: {
+      code:      invite.code,
+      channelId: invite.channel?.id ?? null,
+    },
   });
-
-  await sendLog(invite.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -743,74 +700,71 @@ function isForumPost(thread) {
 client.on('threadCreate', async (thread, newlyCreated) => {
   if (!newlyCreated) return; // ignore threads the bot just gained access to
 
-  const forum  = isForumPost(thread);
-  const title  = forum ? '📌 Forum Post Created' : '🧵 Thread Created';
-  const color  = Colors.Green;
+  const forum = isForumPost(thread);
 
-  const embed = buildEmbed({
-    title,
-    color,
-    description:
-      `**Name:** ${thread.name}\n` +
-      `**Type:** ${channelTypeLabel(thread.type)}\n` +
-      (thread.parent ? `**${forum ? 'Forum' : 'Channel'}:** <#${thread.parent.id}>\n` : '') +
-      `**Created by:** ${thread.ownerId ? `<@${thread.ownerId}>` : 'Unknown'}\n` +
-      `**ID:** ${thread.id}`,
+  await sendLog(thread.guild, {
+    event:     forum ? 'forumPostCreate' : 'threadCreate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: thread.guild.id, name: thread.guild.name },
+    data: {
+      id:        thread.id,
+      name:      thread.name,
+      type:      channelTypeLabel(thread.type),
+      parentId:  thread.parent?.id ?? null,
+      createdBy: thread.ownerId ?? null,
+    },
   });
-
-  await sendLog(thread.guild, embed);
 });
 
 client.on('threadDelete', async (thread) => {
   const forum = isForumPost(thread);
-  const title = forum ? '📌 Forum Post Deleted' : '🧵 Thread Deleted';
 
-  const embed = buildEmbed({
-    title,
-    color: Colors.Red,
-    description:
-      `**Name:** ${thread.name}\n` +
-      (thread.parent ? `**${forum ? 'Forum' : 'Channel'}:** <#${thread.parent.id}>\n` : '') +
-      `**ID:** ${thread.id}`,
+  await sendLog(thread.guild, {
+    event:     forum ? 'forumPostDelete' : 'threadDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: thread.guild.id, name: thread.guild.name },
+    data: {
+      id:       thread.id,
+      name:     thread.name,
+      parentId: thread.parent?.id ?? null,
+    },
   });
-
-  await sendLog(thread.guild, embed);
 });
 
 client.on('threadUpdate', async (oldThread, newThread) => {
-  const changes = [];
+  const changes = {};
 
   if (oldThread.name !== newThread.name) {
-    changes.push(`**Name:** \`${oldThread.name}\` → \`${newThread.name}\``);
+    changes.name = { from: oldThread.name, to: newThread.name };
   }
 
   if (oldThread.archived !== newThread.archived) {
-    changes.push(newThread.archived ? '📦 **Archived**' : '📂 **Unarchived**');
+    changes.archived = { from: oldThread.archived, to: newThread.archived };
   }
 
   if (oldThread.locked !== newThread.locked) {
-    changes.push(newThread.locked ? '🔒 **Locked**' : '🔓 **Unlocked**');
+    changes.locked = { from: oldThread.locked, to: newThread.locked };
   }
 
   if (oldThread.rateLimitPerUser !== newThread.rateLimitPerUser) {
-    changes.push(
-      `**Slowmode:** ${oldThread.rateLimitPerUser}s → ${newThread.rateLimitPerUser}s`,
-    );
+    changes.slowmode = { from: oldThread.rateLimitPerUser, to: newThread.rateLimitPerUser };
   }
 
-  if (changes.length === 0) return;
+  if (Object.keys(changes).length === 0) return;
 
   const forum = isForumPost(newThread);
-  const embed = buildEmbed({
-    title: forum ? '📌 Forum Post Updated' : '🧵 Thread Updated',
-    color: Colors.Yellow,
-    description:
-      `**Thread:** ${newThread.name}\n` +
-      (newThread.parent ? `**${forum ? 'Forum' : 'Channel'}:** <#${newThread.parent.id}>\n` : '') +
-      changes.join('\n'),
-  });
 
-  await sendLog(newThread.guild, embed);
+  await sendLog(newThread.guild, {
+    event:     forum ? 'forumPostUpdate' : 'threadUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newThread.guild.id, name: newThread.guild.name },
+    data: {
+      id:       newThread.id,
+      name:     newThread.name,
+      parentId: newThread.parent?.id ?? null,
+      changes,
+    },
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -819,93 +773,94 @@ client.on('threadUpdate', async (oldThread, newThread) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 client.on('emojiCreate', async (emoji) => {
-  const embed = buildEmbed({
-    title: '😀 Emoji Added',
-    color: Colors.Green,
-    description:
-      `**Name:** \`:${emoji.name}:\`\n` +
-      `**Animated:** ${emoji.animated}\n` +
-      `**ID:** ${emoji.id}`,
+  await sendLog(emoji.guild, {
+    event:     'emojiCreate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: emoji.guild.id, name: emoji.guild.name },
+    data: {
+      id:       emoji.id,
+      name:     emoji.name,
+      animated: emoji.animated,
+      imageURL: emoji.imageURL(),
+    },
   });
-  embed.setThumbnail(emoji.imageURL());
-
-  await sendLog(emoji.guild, embed);
 });
 
 client.on('emojiDelete', async (emoji) => {
-  const embed = buildEmbed({
-    title: '😀 Emoji Removed',
-    color: Colors.Red,
-    description:
-      `**Name:** \`:${emoji.name}:\`\n` +
-      `**Animated:** ${emoji.animated}\n` +
-      `**ID:** ${emoji.id}`,
+  await sendLog(emoji.guild, {
+    event:     'emojiDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: emoji.guild.id, name: emoji.guild.name },
+    data: {
+      id:       emoji.id,
+      name:     emoji.name,
+      animated: emoji.animated,
+    },
   });
-
-  await sendLog(emoji.guild, embed);
 });
 
 client.on('emojiUpdate', async (oldEmoji, newEmoji) => {
   if (oldEmoji.name === newEmoji.name) return;
 
-  const embed = buildEmbed({
-    title: '😀 Emoji Updated',
-    color: Colors.Yellow,
-    description:
-      `**Name:** \`:${oldEmoji.name}:\` → \`:${newEmoji.name}:\`\n` +
-      `**ID:** ${newEmoji.id}`,
+  await sendLog(newEmoji.guild, {
+    event:     'emojiUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newEmoji.guild.id, name: newEmoji.guild.name },
+    data: {
+      id:       newEmoji.id,
+      imageURL: newEmoji.imageURL(),
+      changes:  { name: { from: oldEmoji.name, to: newEmoji.name } },
+    },
   });
-  embed.setThumbnail(newEmoji.imageURL());
-
-  await sendLog(newEmoji.guild, embed);
 });
 
 client.on('stickerCreate', async (sticker) => {
-  const embed = buildEmbed({
-    title: '🪄 Sticker Added',
-    color: Colors.Green,
-    description:
-      `**Name:** ${sticker.name}\n` +
-      `**Description:** ${sticker.description || '*(none)*'}\n` +
-      `**ID:** ${sticker.id}`,
+  await sendLog(sticker.guild, {
+    event:     'stickerCreate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: sticker.guild.id, name: sticker.guild.name },
+    data: {
+      id:          sticker.id,
+      name:        sticker.name,
+      description: sticker.description || null,
+    },
   });
-
-  await sendLog(sticker.guild, embed);
 });
 
 client.on('stickerDelete', async (sticker) => {
-  const embed = buildEmbed({
-    title: '🪄 Sticker Removed',
-    color: Colors.Red,
-    description:
-      `**Name:** ${sticker.name}\n` +
-      `**ID:** ${sticker.id}`,
+  await sendLog(sticker.guild, {
+    event:     'stickerDelete',
+    timestamp: new Date().toISOString(),
+    guild:     { id: sticker.guild.id, name: sticker.guild.name },
+    data: {
+      id:   sticker.id,
+      name: sticker.name,
+    },
   });
-
-  await sendLog(sticker.guild, embed);
 });
 
 client.on('stickerUpdate', async (oldSticker, newSticker) => {
-  const changes = [];
+  const changes = {};
 
   if (oldSticker.name !== newSticker.name) {
-    changes.push(`**Name:** \`${oldSticker.name}\` → \`${newSticker.name}\``);
+    changes.name = { from: oldSticker.name, to: newSticker.name };
   }
   if (oldSticker.description !== newSticker.description) {
-    changes.push(
-      `**Description:** ${oldSticker.description || '*(none)*'} → ${newSticker.description || '*(none)*'}`,
-    );
+    changes.description = { from: oldSticker.description || null, to: newSticker.description || null };
   }
 
-  if (changes.length === 0) return;
+  if (Object.keys(changes).length === 0) return;
 
-  const embed = buildEmbed({
-    title: '🪄 Sticker Updated',
-    color: Colors.Yellow,
-    description: `**ID:** ${newSticker.id}\n${changes.join('\n')}`,
+  await sendLog(newSticker.guild, {
+    event:     'stickerUpdate',
+    timestamp: new Date().toISOString(),
+    guild:     { id: newSticker.guild.id, name: newSticker.guild.name },
+    data: {
+      id:      newSticker.id,
+      name:    newSticker.name,
+      changes,
+    },
   });
-
-  await sendLog(newSticker.guild, embed);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -934,31 +889,33 @@ client.on('webhooksUpdate', async (channel) => {
   // Detect created webhooks
   for (const [id, wh] of fresh) {
     if (!cached.has(id)) {
-      const embed = buildEmbed({
-        title: '🪝 Webhook Created',
-        color: Colors.Green,
-        description:
-          `**Name:** ${wh.name}\n` +
-          `**Channel:** <#${channel.id}>\n` +
-          `**Created by:** ${wh.owner?.tag ?? 'Unknown'}\n` +
-          `**ID:** ${wh.id}`,
+      await sendLog(channel.guild, {
+        event:     'webhookCreate',
+        timestamp: new Date().toISOString(),
+        guild:     { id: channel.guild.id, name: channel.guild.name },
+        data: {
+          id:        wh.id,
+          name:      wh.name,
+          channelId: channel.id,
+          createdBy: wh.owner?.tag ?? null,
+        },
       });
-      await sendLog(channel.guild, embed);
     }
   }
 
   // Detect deleted webhooks
   for (const [id, wh] of cached) {
     if (!fresh.has(id)) {
-      const embed = buildEmbed({
-        title: '🪝 Webhook Deleted',
-        color: Colors.Red,
-        description:
-          `**Name:** ${wh.name}\n` +
-          `**Channel:** <#${channel.id}>\n` +
-          `**ID:** ${wh.id}`,
+      await sendLog(channel.guild, {
+        event:     'webhookDelete',
+        timestamp: new Date().toISOString(),
+        guild:     { id: channel.guild.id, name: channel.guild.name },
+        data: {
+          id:        wh.id,
+          name:      wh.name,
+          channelId: channel.id,
+        },
       });
-      await sendLog(channel.guild, embed);
     }
   }
 
@@ -967,23 +924,25 @@ client.on('webhooksUpdate', async (channel) => {
     const cachedWh = cached.get(id);
     if (!cachedWh) continue;
 
-    const changes = [];
+    const changes = {};
     if (cachedWh.name !== freshWh.name) {
-      changes.push(`**Name:** \`${cachedWh.name}\` → \`${freshWh.name}\``);
+      changes.name = { from: cachedWh.name, to: freshWh.name };
     }
     if (cachedWh.channelId !== freshWh.channelId) {
-      changes.push(`**Channel:** <#${cachedWh.channelId}> → <#${freshWh.channelId}>`);
+      changes.channelId = { from: cachedWh.channelId, to: freshWh.channelId };
     }
 
-    if (changes.length > 0) {
-      const embed = buildEmbed({
-        title: '🪝 Webhook Updated',
-        color: Colors.Yellow,
-        description:
-          `**ID:** ${freshWh.id}\n` +
-          changes.join('\n'),
+    if (Object.keys(changes).length > 0) {
+      await sendLog(channel.guild, {
+        event:     'webhookUpdate',
+        timestamp: new Date().toISOString(),
+        guild:     { id: channel.guild.id, name: channel.guild.name },
+        data: {
+          id:      freshWh.id,
+          name:    freshWh.name,
+          changes,
+        },
       });
-      await sendLog(channel.guild, embed);
     }
   }
 
