@@ -2,6 +2,8 @@
 
 A comprehensive Discord logging bot that tracks virtually all server activity — members, messages, channels, roles, voice, threads, forums, emojis, stickers, invites, webhooks, and server settings — and posts rich embeds to a designated log channel.
 
+Also ships with a full **automoderation and anti-raid system** (`automod.js`) that protects the server from spam, raids, permission escalation, and other common attacks.
+
 > **Moderation logs (bans, kicks, timeouts, warnings, mutes) are intentionally disabled.** Stub functions are in place for when a dedicated moderation bot is ready to integrate.
 
 ---
@@ -98,6 +100,58 @@ Bans, unbans, kicks, timeouts, warnings, and mutes are **not logged** by this bo
 
 ---
 
+## 🛡️ Automoderation & Anti-Raid
+
+All automod logic lives in `automod.js` and is automatically initialised when the bot starts. Security alerts are sent to `SECURITY_LOG_CHANNEL_ID` (falls back to `LOG_CHANNEL_ID` if unset).
+
+### Automoderation rules
+
+| Rule | Trigger | Default action |
+|---|---|---|
+| **Spam Detection** | >5 messages in 5 seconds (per user per channel) | Mute (5 min) |
+| **Mention Spam** | >5 unique mentions in one message | Mute (10 min) |
+| **Discord Invite Links** | Any `discord.gg` / `discord.com/invite` link | Warn + delete |
+| **Link Detection** | Any non-whitelisted URL | Log |
+| **Profanity / Keyword Filter** | Configurable word list (case-insensitive) | Warn + delete |
+| **Caps Spam** | >70% uppercase in messages >10 chars | Warn |
+| **Repeated Character Spam** | 6+ consecutive identical characters | Warn |
+| **Suspicious Patterns** | Zalgo text, RTL override, zero-width chars, emoji spam | Log |
+
+### Anti-Raid / Security rules
+
+| Rule | Trigger | Default action |
+|---|---|---|
+| **Mass Join** | >10 joins in 60 seconds | Security alert |
+| **Mass Ban** | >5 bans in 60 seconds | Security alert |
+| **Mass Kick** | >5 kicks in 60 seconds | Security alert |
+| **Mass Role Changes** | >10 role changes in 60 seconds | Security alert |
+| **Mass Channel Creation** | >5 channels created in 60 seconds | Security alert |
+| **Mass Channel Deletion** | >5 channels deleted in 60 seconds | Security alert |
+| **Webhook Spam** | >3 webhooks created in 60 seconds | Security alert |
+| **Permission Escalation** | Non-admin gains Administrator or other dangerous perms | Security alert |
+| **New Account** | Account created <7 days ago joins the server | Security alert |
+| **Suspicious Activity Score** | Accumulated violation points reach threshold (10) | Security alert |
+
+### Configuring automod
+
+Open `automod.js` and edit the `config` object at the top of the file. Every rule has an `enabled` toggle, threshold values, and an `action` field:
+
+| Action | Effect |
+|---|---|
+| `log` | Post a security embed to the security log channel only |
+| `warn` | Log + DM the user with a warning |
+| `mute` | Log + timeout the user for `muteDurationMs` milliseconds |
+| `kick` | Log + DM + kick the user |
+| `ban` | Log + DM + ban the user (deletes 24 h of messages) |
+
+**Whitelist** users, roles, or channels by adding their IDs to `config.whitelist.userIds`, `config.whitelist.roleIds`, or `config.whitelist.channelIds`.
+
+**Link whitelist** — domains in `config.automod.links.whitelist` are never flagged by the link-detection rule.
+
+**Profanity list** — add banned words (lower-case) to `config.automod.profanity.words`.
+
+---
+
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 18 or later
@@ -109,6 +163,10 @@ Bans, unbans, kicks, timeouts, warnings, and mutes are **not logged** by this bo
   - **Read Message History**
   - **Manage Webhooks** — required to fetch and diff webhooks
   - **Manage Guild** — required to fetch invites for invite tracking
+  - **Moderate Members** — required for the automod mute (timeout) action
+  - **Kick Members** — required for the automod kick action
+  - **Ban Members** — required for the automod ban action
+  - **View Audit Log** — required for mass-kick detection
 
 ### Required Privileged Gateway Intents
 
@@ -147,7 +205,8 @@ Enable **all three** in the Discord Developer Portal under your application → 
    | Variable | Description |
    |---|---|
    | `DISCORD_TOKEN` | Your bot token from the Discord Developer Portal |
-   | `LOG_CHANNEL_ID` | The ID of the text channel to send log messages to |
+   | `LOG_CHANNEL_ID` | The ID of the text channel to send general log messages to |
+   | `SECURITY_LOG_CHANNEL_ID` | *(Optional)* Separate channel for automod/security alerts. Falls back to `LOG_CHANNEL_ID` if unset |
 
    > **Tip — finding a channel ID:** Enable Developer Mode in Discord (*Settings → Advanced → Developer Mode*), then right-click any text channel and choose **Copy Channel ID**.
 
@@ -172,6 +231,7 @@ Enable **all three** in the Discord Developer Portal under your application → 
 3. Add the following environment variables in the Railway dashboard under **Variables**:
    - `DISCORD_TOKEN`
    - `LOG_CHANNEL_ID`
+   - `SECURITY_LOG_CHANNEL_ID` *(optional — dedicated channel for automod/security alerts)*
 4. Railway will automatically run `npm start` using the `start` script in `package.json`.
 
 The bot will start automatically on every deploy and restart on crash thanks to Railway's built-in process management.
@@ -195,7 +255,8 @@ The `GuildModeration` intent is already enabled, so no further configuration is 
 
 ```
 atlas-logging/
-├── index.js          # Bot entry point — all event listeners live here
+├── index.js          # Bot entry point — all logging event listeners live here
+├── automod.js        # Automoderation & anti-raid system (config, rules, actions)
 ├── package.json      # Dependencies and start script
 ├── .env.example      # Environment variable template
 └── README.md         # This file
