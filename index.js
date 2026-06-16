@@ -9,6 +9,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildWebhooks,
     GatewayIntentBits.MessageContent,
   ],
 });
@@ -223,6 +224,29 @@ client.on('roleDelete', async (role) => {
   });
 
   await sendLog(role.guild, embed);
+});
+
+// ---------------------------------------------------------------------------
+// Webhook events
+// ---------------------------------------------------------------------------
+client.on('webhookCreate', async (webhook) => {
+  const embed = buildEmbed({
+    title: '🔗 Webhook Created',
+    color: Colors.Blurple,
+    description: `**Name:** ${webhook.name}\n**ID:** ${webhook.id}\n**Channel:** <#${webhook.channelId}>`,
+  });
+
+  await sendLog(webhook.guild, embed);
+});
+
+client.on('webhookDelete', async (webhook) => {
+  const embed = buildEmbed({
+    title: '🔗 Webhook Deleted',
+    color: Colors.Red,
+    description: `**Name:** ${webhook.name}\n**ID:** ${webhook.id}\n**Channel:** <#${webhook.channelId}>`,
+  });
+
+  await sendLog(webhook.guild, embed);
 });
 
 // ---------------------------------------------------------------------------
