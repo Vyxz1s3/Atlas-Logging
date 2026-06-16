@@ -9,6 +9,15 @@ const {
 } = require('discord.js');
 
 // ---------------------------------------------------------------------------
+// Automod & Anti-Raid system
+// Loaded here so it can attach its own event listeners to the same client.
+// All configuration lives in automod.js — edit thresholds and actions there.
+// Set SECURITY_LOG_CHANNEL_ID in .env to route security alerts to a separate
+// channel; falls back to LOG_CHANNEL_ID if unset.
+// ---------------------------------------------------------------------------
+const automod = require('./automod');
+
+// ---------------------------------------------------------------------------
 // Client setup
 // All privileged intents required for comprehensive logging:
 //   - GuildMembers   → member join/leave/update events
@@ -160,6 +169,9 @@ client.once('ready', async () => {
       // Bot may lack MANAGE_GUILD — silently skip
     }
   }
+
+  // Initialise automod — attaches all automod/anti-raid event listeners
+  automod.init(client);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
